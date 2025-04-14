@@ -1,4 +1,4 @@
-module github.com/CloudPassenger/caddy-pg-wrap
+module github.com/CloudPassenger/caddy-pgssl-wrap
 
 go 1.23.0
 
