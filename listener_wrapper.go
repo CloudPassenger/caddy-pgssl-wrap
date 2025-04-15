@@ -3,13 +3,14 @@ package wrapper
 import (
 	"bufio"
 	"bytes"
+	"errors"
+	"io"
 	"net"
 	"sync"
 	"time"
 
-	"slices"
-
 	"github.com/caddyserver/caddy/v2"
+	"go.uber.org/zap"
 )
 
 var (
@@ -33,14 +34,18 @@ type ListenerWrapper struct {
 
 	// Deny specifies which IPs are not allowed to use this wrapper
 	Deny []string `json:"deny,omitempty"`
+
+	Logger *zap.Logger
 }
 
 // Provision sets up the listener wrapper.
 func (pp *ListenerWrapper) Provision(ctx caddy.Context) error {
 	// If no timeout is specified, use a default of 3 seconds
 	if pp.Timeout == 0 {
-		pp.Timeout = caddy.Duration(3 * time.Second)
+		pp.Timeout = caddy.Duration(300 * time.Millisecond)
 	}
+
+	pp.Logger = ctx.Logger(pp)
 
 	return nil
 }
@@ -52,6 +57,7 @@ func (pp *ListenerWrapper) WrapListener(l net.Listener) net.Listener {
 		timeout:  time.Duration(pp.Timeout),
 		allow:    pp.Allow,
 		deny:     pp.Deny,
+		logger:   pp.Logger,
 	}
 }
 
@@ -62,12 +68,14 @@ type pgListener struct {
 	timeout time.Duration
 	allow   []string
 	deny    []string
+	logger  *zap.Logger
 }
 
 // Accept accepts and returns the next connection to the listener.
 func (l *pgListener) Accept() (net.Conn, error) {
 	conn, err := l.Listener.Accept()
 	if err != nil {
+		l.logger.Error("Error accepting connection", zap.Error(err))
 		return nil, err
 	}
 
@@ -75,8 +83,11 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	// This allows other components to process the connection instead of rejecting
 	if len(l.deny) > 0 {
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		if slices.Contains(l.deny, ip) {
-			return conn, nil // Return original connection instead of closing
+		for _, deny := range l.deny {
+			if ip == deny {
+				l.logger.Debug("denied connection by deny list", zap.String("ip", ip))
+				return conn, nil // Return original connection instead of closing
+			}
 		}
 	}
 
@@ -84,7 +95,14 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	// If allow list exists and IP is not in it, return original connection
 	if len(l.allow) > 0 {
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		allowed := slices.Contains(l.allow, ip)
+		allowed := false
+		for _, allow := range l.allow {
+			if ip == allow {
+				l.logger.Debug("allowed connection by allow list", zap.String("ip", ip))
+				allowed = true
+				break
+			}
+		}
 		if !allowed {
 			return conn, nil // Return original connection instead of closing
 		}
@@ -94,7 +112,10 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	if l.timeout > 0 {
 		err = conn.SetReadDeadline(time.Now().Add(l.timeout))
 		if err != nil {
-			return conn, nil // Return original connection on error
+			// On error setting deadline, return the original connection
+			// to allow other wrappers to handle it potentially.
+			l.logger.Error("Error setting read deadline", zap.Error(err))
+			return conn, nil
 		}
 	}
 
@@ -103,27 +124,26 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	br := bufio.NewReaderSize(conn, 4096)
 
 	// Try to detect if this is a PostgreSQL SSL request
-	isPg, err := isPostgres(br)
+	isPg, peekErr := isPostgres(br)
+	if peekErr != nil {
+		l.logger.Error("Error detecting PostgreSQL SSL request", zap.Error(peekErr))
+	}
 
-	// Reset the deadline
+	l.logger.Debug("Detected PostgreSQL SSL request", zap.Bool("isPg", isPg), zap.Error(err))
+
+	// Reset the deadline immediately after peeking
 	if l.timeout > 0 {
 		_ = conn.SetReadDeadline(time.Time{})
 	}
 
-	// If error (timeout or connection closed), just return the original connection
-	if err != nil {
-		return conn, nil
-	}
-
-	// If it's not a PostgreSQL connection, return original connection
-	if !isPg {
-		return conn, nil
-	}
-
-	// If it is a PostgreSQL connection, wrap it to handle the SSL handshake
+	// Regardless of whether it's PG or if there was a peek error,
+	// wrap the connection with pgConn to ensure the buffered reader is used.
+	// The isTLS flag will determine the behavior in pgConn.Read.
+	// If peekErr is not nil (e.g., timeout), isPg will be false.
 	return &pgConn{
-		Conn:   conn,
-		reader: br,
+		Conn:    conn,
+		reader:  br,
+		isPgTLS: isPg && peekErr == nil, // Only treat as TLS if detection succeeded
 	}, nil
 }
 
@@ -132,6 +152,13 @@ func isPostgres(br *bufio.Reader) (bool, error) {
 	// Peek the exact number of bytes we need for the PostgreSQL SSL request
 	peeked, err := br.Peek(len(PostgresStartTLSMsg))
 	if err != nil {
+		// Don't log EOF or timeout errors, they are expected in some cases
+		// But return the error so Accept knows detection might have failed
+		var opErr *net.OpError
+		if errors.Is(err, io.EOF) || (errors.As(err, &opErr) && opErr.Timeout()) {
+			return false, err
+		}
+		// Log other unexpected errors
 		return false, err
 	}
 
@@ -140,44 +167,51 @@ func isPostgres(br *bufio.Reader) (bool, error) {
 }
 
 // pgConn is a net.Conn that handles PostgreSQL SSL negotiation
+// or passes through data if not a PG TLS connection.
 type pgConn struct {
 	net.Conn
-	reader *bufio.Reader
+	reader  *bufio.Reader
+	isPgTLS bool
 
-	mu        sync.Mutex
-	msgSent   bool // Whether we have consumed the SSL request message
-	replySent bool // Whether we have sent the 'S' reply
+	mu      sync.Mutex
+	msgSent bool // Whether the SSL handshake has been completed
 }
 
 // Read reads data from the connection.
-// If this is a PostgreSQL TLS connection, it handles the SSL request message.
+// If this is a PostgreSQL TLS connection, it handles the SSL request message first.
 func (c *pgConn) Read(b []byte) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If not a TLS connection or already processed the handshake, just read normally
+	// If it's not a PG TLS connection, just read directly from the buffered reader.
+	if !c.isPgTLS {
+		return c.reader.Read(b)
+	}
+
+	// If it is a PG TLS connection, but we've already handled the handshake.
 	if c.msgSent {
 		return c.reader.Read(b)
 	}
 
+	// --- Handle the initial PG TLS handshake ---
+
 	// Consume the SSL request message from the buffer without allocating new memory
-	// We know it's already in the buffer because we peeked it
+	// We know it's already in the buffer because we peeked it in Accept.
 	_, err = c.reader.Discard(len(PostgresStartTLSMsg))
 	if err != nil {
 		return 0, err
 	}
 
-	// Mark message as sent
-	c.msgSent = true
-
-	// Send the reply indicating SSL is supported
+	// Send the reply ('S') indicating SSL is supported
 	_, err = c.Conn.Write(PostgresStartTLSReply)
 	if err != nil {
 		return 0, err
 	}
-	c.replySent = true
 
-	// Continue reading from the connection
+	// Mark handshake as completed
+	c.msgSent = true
+
+	// Continue reading the actual TLS handshake data from the connection
 	return c.reader.Read(b)
 }
 
