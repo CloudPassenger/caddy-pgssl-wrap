@@ -7,8 +7,6 @@ import (
 	"sync"
 	"time"
 
-	"slices"
-
 	"github.com/caddyserver/caddy/v2"
 )
 
@@ -75,8 +73,10 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	// This allows other components to process the connection instead of rejecting
 	if len(l.deny) > 0 {
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		if slices.Contains(l.deny, ip) {
-			return conn, nil // Return original connection instead of closing
+		for _, deny := range l.deny {
+			if ip == deny {
+				return conn, nil // Return original connection instead of closing
+			}
 		}
 	}
 
@@ -84,7 +84,13 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	// If allow list exists and IP is not in it, return original connection
 	if len(l.allow) > 0 {
 		ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
-		allowed := slices.Contains(l.allow, ip)
+		allowed := false
+		for _, allow := range l.allow {
+			if ip == allow {
+				allowed = true
+				break
+			}
+		}
 		if !allowed {
 			return conn, nil // Return original connection instead of closing
 		}
@@ -105,22 +111,22 @@ func (l *pgListener) Accept() (net.Conn, error) {
 	// Try to detect if this is a PostgreSQL SSL request
 	isPg, err := isPostgres(br)
 
-	// Reset the deadline
+	// Reset the deadline immediately to prevent timeout issues
 	if l.timeout > 0 {
 		_ = conn.SetReadDeadline(time.Time{})
 	}
 
-	// If error (timeout or connection closed), just return the original connection
-	if err != nil {
-		return conn, nil
+	// If it's not a PostgreSQL connection or we had an error peeking,
+	// return a buffered connection with the original reader content
+	if !isPg || err != nil {
+		// Return a buffered connection that preserves what we've read
+		return &bufferedConn{
+			Conn:   conn,
+			reader: br,
+		}, nil
 	}
 
-	// If it's not a PostgreSQL connection, return original connection
-	if !isPg {
-		return conn, nil
-	}
-
-	// If it is a PostgreSQL connection, wrap it to handle the SSL handshake
+	// If it is a PostgreSQL connection, wrap it with our special handler
 	return &pgConn{
 		Conn:   conn,
 		reader: br,
@@ -139,6 +145,18 @@ func isPostgres(br *bufio.Reader) (bool, error) {
 	return bytes.Equal(peeked, PostgresStartTLSMsg), nil
 }
 
+// bufferedConn is a basic wrapper around a connection with a buffered reader
+// This is used for non-PostgreSQL connections to avoid losing data we've peeked
+type bufferedConn struct {
+	net.Conn
+	reader *bufio.Reader
+}
+
+// Read reads data from the connection.
+func (c *bufferedConn) Read(b []byte) (n int, err error) {
+	return c.reader.Read(b)
+}
+
 // pgConn is a net.Conn that handles PostgreSQL SSL negotiation
 type pgConn struct {
 	net.Conn
@@ -155,7 +173,7 @@ func (c *pgConn) Read(b []byte) (n int, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// If not a TLS connection or already processed the handshake, just read normally
+	// If already processed the handshake, just read normally
 	if c.msgSent {
 		return c.reader.Read(b)
 	}
